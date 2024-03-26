@@ -1,0 +1,553 @@
+---
+title: "Movie Recommendation"
+author: "madibaa"
+date: "2024-03-25"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+In this project, we are looking to create a movie recommendation system using the 10M version of the MovieLens dataset.The goal of this project is the create an algorithm that minimises the root mean squared error (RMSE) < 0.86490, which translates to greater accuracy in predicting a user's movie preferences.
+
+Here is a broad overview of the project's implementation:
+
+1.  Import the MovieLens dataset and generate the validation and final holdout sets using the provided code.
+2.  Conduct exploratory analyses on the validation dataset
+3.  Generate training and test sets from the validation set
+4.  Implement a content-based filtering strategy
+5.  Implement matrix factorisation using the recosystem package
+6.  Evaluate the model using the final holdout set
+
+Let's dive right in!
+
+```{r initial code from HarvardX}
+if(!require(tidyverse)) install.packages("tidyverse", repos = "http://cran.us.r-project.org")
+if(!require(caret)) install.packages("caret", repos = "http://cran.us.r-project.org")
+  
+library(tidyverse)
+library(caret)
+
+# MovieLens 10M dataset:
+# https://grouplens.org/datasets/movielens/10m/
+# http://files.grouplens.org/datasets/movielens/ml-10m.zip
+
+options(timeout = 120)
+  
+dl <- "ml-10M100K.zip"
+if(!file.exists(dl))
+  download.file("https://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+  
+ratings_file <- "ml-10M100K/ratings.dat"
+if(!file.exists(ratings_file))
+  unzip(dl, ratings_file)
+  
+movies_file <- "ml-10M100K/movies.dat"
+if(!file.exists(movies_file))
+  unzip(dl, movies_file)
+  
+ratings <- as.data.frame(str_split(read_lines(ratings_file), fixed("::"), simplify = TRUE),
+                           stringsAsFactors = FALSE)
+colnames(ratings) <- c("userId", "movieId", "rating", "timestamp")
+ratings <- ratings %>%
+  mutate(userId = as.integer(userId),
+         movieId = as.integer(movieId),
+         rating = as.numeric(rating),
+         timestamp = as.integer(timestamp))
+  
+movies <- as.data.frame(str_split(read_lines(movies_file), fixed("::"), simplify = TRUE),
+                        stringsAsFactors = FALSE)
+colnames(movies) <- c("movieId", "title", "genres")
+movies <- movies %>%
+  mutate(movieId = as.integer(movieId))
+  
+movielens <- left_join(ratings, movies, by = "movieId")
+
+# Final hold-out test set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") # if using R 3.6 or later
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+  
+# Make sure userId and movieId in final hold-out test set are also in edx set
+final_holdout_test <- temp %>% 
+  semi_join(edx, by = "movieId") %>%
+  semi_join(edx, by = "userId")
+  
+# Add rows removed from final hold-out test set back into edx set
+removed <- anti_join(temp, final_holdout_test)
+edx <- rbind(edx, removed)
+  
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+## Exploratory analyses
+
+Let's load some additional packages to aid our analysis.
+
+```{r}
+library(data.table)
+library(lubridate)
+```
+
+Now, we start by conducting some initial exploratory analyses of edx.
+
+```{r}
+head(edx)
+dim(edx)
+str(edx)
+summary(edx)
+```
+
+We see that edx comprises 6 columns: userId, movieId, rating, timestamp, title, and genres, with 900,055 observations.
+
+# Further exploratory analyses
+To see the number of users and movies:
+
+```{r}
+edx %>%
+  summarise(n_users = n_distinct(userId),
+            n_movies = n_distinct(movieId))
+```
+
+We see that there are 69,878 unique users and 10,677 unique movies.
+
+What is the mean rating and mean rating per user??
+
+```{r}
+mean(edx$rating)
+mean_per_user <- edx %>%
+  group_by(userId) %>%
+  summarise(mean_rating = mean(rating))
+mean(mean_per_user$mean_rating)
+```
+
+The mean rating is 3.512, and mean rating per user is 3.613.
+
+Let's visualise the distribution of ratings with a plot.
+
+```{r}
+edx %>%
+  group_by(rating) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = rating, y = count)) +
+  geom_bar(stat = "identity", fill = "skyblue", colour = "black") +
+  ggtitle("Rating Distribution") +
+  xlab("Rating") +
+  ylab("Occurrences Count")
+```
+
+We see that users tend to favour higher ratings and whole number ratings.
+
+Let's create another plot to visualise the number of movies rated per user.
+
+```{r}
+edx %>%
+  group_by(userId) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) +
+  geom_histogram(binwidth = 0.1, fill = "skyblue", colour = "black") +
+  ggtitle("Ratings per user") +
+  xlab("Number of ratings per User") +
+  ylab("Count") +
+  scale_x_log10()
+```
+
+We see that most users rate less than 100 movies.
+
+Let's create another plot to visualise the number of ratings per movie.
+```{r}
+edx %>%
+  group_by(movieId) %>%
+  summarise(count = n()) %>%
+  ggplot(aes(x = count)) +
+  geom_histogram(binwidth = 0.1, fill = "skyblue", colour = "black") +
+  ggtitle("Ratings per movie") +
+  xlab("Number of ratings per Movie") +
+  ylab("Count") +
+  scale_x_log10()
+```
+
+We see that most movies are rated between 10 and 1000 times.
+
+Let's see the top 10 rated movies.
+```{r}
+top10 <- edx %>% 
+  group_by(movieId) %>%
+  summarise(title = title[1], rating = mean(rating)) %>%
+  top_n(10, rating) %>%
+  arrange(desc(rating)) %>%
+  slice(1:10)
+top10
+```
+
+These are pretty obscure movies. Let's see the number of ratings each movie has.
+```{r}
+top10 %>%
+  inner_join(edx, by = "movieId") %>%
+  group_by(movieId, title.x) %>%
+  summarise(count = n())
+```
+
+Each of these movies has a pretty low number of ratings.
+
+Let's see if the same holds true for the bottom 10 rated movies.
+```{r}
+bottom10 <- edx %>% 
+  group_by(movieId) %>%
+  summarise(title = title[1], rating = mean(rating)) %>%
+  top_n(-10, rating) %>%
+  arrange(rating) %>%
+  slice(1:10)
+bottom10
+
+bottom10 %>%
+  inner_join(edx, by = "movieId") %>%
+  group_by(movieId, title.x) %>%
+  summarise(count = n())
+```
+
+The pattern of low ratings is still broadly true, with 6/10 of the worst rated movies having 1 or 2 ratings only.
+
+From str(edx), we see that the timestamp is an integer.
+Let's extract the year and conduct a yearly rating count.
+```{r}
+edx <- edx %>% 
+  mutate(year = year(as_datetime(timestamp, origin = "1970-01-01")))
+edx %>%
+  group_by(year) %>%
+  summarize(count = n())
+```
+
+Let's create a plot to visualise the distribution of ratings per year.
+```{r}
+edx %>% group_by(movieId) %>%
+  summarize(n = n(), year = as.character(first(year))) %>%
+  ggplot(aes(x = year, y = n)) +
+  geom_boxplot() +
+  ggtitle("Ratings by Year") +
+  scale_y_sqrt() +
+  xlab("Year") +
+  ylab("Number of Ratings")
+```
+
+We see that newer movies have fewer ratings, as they haven't had sufficient time to accumulate ratings.
+
+Let's create a plot to visualise the average distribution of ratings for each year.
+```{r}
+edx %>% 
+  group_by(year) %>%
+  summarise(avg = mean(rating)) %>%
+  ggplot(aes(x = year, y = avg)) +
+  geom_bar(stat = "identity", fill = "skyblue", colour = "black") + 
+  ggtitle("Average rating per year") +
+  xlab("Year") +
+  ylab("Average rating")
+```
+
+Pretty uniform ratings average each year (the anomaly being 1995, which only has 2 ratings). We don't need to be concerned that newer movies with fewer ratings are rated more poorly. 
+
+Now let's take a look at genres.
+```{r}
+edx %>% group_by(genres) %>%
+  summarise(n())
+```
+
+Many (or most) movies are listed as having multiple genres. Let's look at the spread of individual genres.
+```{r}
+genres <- c("Action", "Adventure", "Animation", 
+            "Children", "Comedy", "Crime", 
+            "Documentary", "Drama", "Fantasy", 
+            "Film-Noir", "Horror", "Musical", 
+            "Mystery", "Romance", "Sci-Fi", 
+            "Thriller", "War", "Western")
+
+genres_count <- data.frame(Genres = genres, Count = sapply(genres, function(x){
+    sum(str_detect(edx$genres, x))
+  })
+)
+genres_count %>% arrange(desc(Count))
+```
+
+We see that the most popular genre has almost 4 million ratings while the least popular has under 100,000 ratings.
+
+Let's create a plot to visualise genre popularity.
+```{r}
+genres_count %>%
+  ggplot(aes(x = Count, y = reorder(Genres, Count))) +
+  geom_bar(stat = "identity", width = 0.6, fill = "lightblue") +
+  ggtitle("Genre Popularity") +
+  xlab("Number of Ratings") +
+  ylab("Genres")
+```
+
+We can see that drama and comedy are among the most popular genres, and film-noir and documentary are among the least popular.
+
+Let's look at the average rating for each genre.
+```{r}
+genres_rating <- data.frame(Genres = genres, Rating = sapply(genres, function(x){
+  mean(edx %>%
+    filter(str_detect(genres, x)) %>%
+    pull(rating))
+  })
+)
+genres_rating
+```
+
+And to visualise that with a plot. 
+```{r}
+genres_rating %>% ggplot(aes(x = Genres, y = (Rating))) +
+  geom_bar(stat = "identity", fill = "skyblue", color = "black") +
+  ggtitle("Average Rating by Genre") +
+  xlab("Genre") +
+  ylab("Average Rating") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+We see that there are some differences in average ratings for different genres.
+
+## Model building
+
+Now that we have thoroughly inspected the validation dataset, it is time to begin building our model. We will use a content-based filtering strategy accounting for user bias, movie bias, and genre bias. We will then apply regularisation to the model to see if it further minimises RMSE. Finally, we will evaluate a matrix factorisation model using the recosystem package.
+
+Let's begin by creating our training and test sets. The test set will be 10% of edx data.
+```{r}
+set.seed(123) # Set seed for replicability
+test_index <- createDataPartition(edx$rating, times = 1, p = 0.1, list = FALSE)
+test_set <- edx[test_index, ]
+train_set <- edx[-test_index, ]
+
+# To make sure userId and movieId in test set are also in training set
+test_set <- test_set %>% 
+  semi_join(train_set, by = "movieId") %>%
+  semi_join(train_set, by = "userId")
+
+```
+
+Next, let's load the rmse function from the Metrics package.
+```{r}
+if(!require(Metrics)) install.packages("Metrics", repos = "http://cran.us.r-project.org")
+library(Metrics)
+```
+
+With that, let's dive in and build our first model! Here's the first model: average of all ratings (mu).
+```{r}
+mu <- mean(train_set$rating)
+mu
+
+rmse_base <- rmse(test_set$rating, mu)
+rmse_results <- tibble(method = "Mean baseline", rmse = rmse_base)
+rmse_results
+```
+
+With the mean baseline model, we achieve an RMSE of 1.06061. Let's see if we can improve on that.
+
+Next, we know that certain movies are generally more highly rated than other movies. Thus, let us factor in movie bias (b_i) into our model.
+```{r}
+b_i <- train_set %>%
+  group_by(movieId) %>% 
+  summarise(b_i = mean(rating - mu))
+
+pred_i <- mu + test_set %>% 
+  left_join(b_i, by="movieId") %>%
+  pull(b_i)
+
+rmse_i <- rmse(pred_i, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie Effect Model",
+                                 rmse = rmse_i))
+rmse_results
+```
+
+With the movie effect model, we effectively lowered the RMSE to 0.94321.
+
+We also know that users differ in how they rate movies - some tend to rate conservatively, others tend to give very high ratings. Thus, let us factor in user bias (b_u) into our model.
+```{r}
+b_u <- train_set %>%
+  left_join(b_i, by="movieId") %>%
+  group_by(userId) %>% 
+  summarise(b_u = mean(rating - mu - b_i))
+
+pred_i_u <- test_set %>% 
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+rmse_i_u <- rmse(pred_i_u, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie + User Effect Model",
+                                 rmse = rmse_i_u))
+rmse_results
+```
+
+With our movie + user effect model, we managed to lower the RMSE to 0.86504.
+
+From our exploratory analyses, we saw that there were some differences in ratings among individual genres. Some genres were more well loved than others. Let us attempt to factor in a genre bias (b_g) into our model.
+```{r}
+# We begin by teasing out the average rating for each genre
+train_genres <- data.frame(genres = genres, rating = sapply(genres, function(x){
+  mean(train_set %>%
+         filter(str_detect(genres, x)) %>%
+         pull(rating))
+})
+)
+train_genres
+
+# We then subtract the average rating for each genre by the average of all ratings to obtain specific genre bias (b_g)
+b_g <- data.frame(genres = genres, b_g = train_genres$rating - mu)
+
+# Now, we build it into our model
+test_set_genres <- test_set %>%
+  mutate(genres_list = strsplit(genres, "\\|")) %>%
+  unnest(genres_list) %>%
+  left_join(b_g, by = c("genres_list" = "genres")) %>%
+  group_by(userId, movieId) %>%
+  summarise(b_g = sum(b_g, na.rm = TRUE))
+
+pred_i_u_g <- test_set %>% 
+  left_join(b_i, by="movieId") %>%
+  left_join(b_u, by="userId") %>%
+  left_join(test_set_genres, by=c("userId" = "userId", "movieId" = "movieId"), 
+            relationship = "many-to-many") %>%
+  mutate(pred = mu + b_i + b_u + b_g) %>%
+  pull(pred)
+
+rmse_i_u_g <- rmse(pred_i_u_g, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Movie + User + Genre Effect Model",
+                                 rmse = rmse_i_u_g))
+rmse_results
+```
+
+With the movie, + user + genre effect model, the RMSE actually increased slightly to 0.88702. Somewhat disheartening given our efforts to include a genre bias. As including a genre bias is not helpful, we will continue building our model without it.
+
+Next, recall that our top 10 and bottom 10 movies in terms of ratings are mostly obscure movies that were rated by very few users. We should not trust these ratings in making useful predictions. To counter this, we can use regularisation to penalise large estimates resulting from small sample sizes.
+
+Let's proceed to regularise our movie + user effect model. 
+```{r}
+# Regularisation involves adding a tuning parameter (lambda) that penalises large estimates
+# To find the optimal lambda, let's use cross validation
+lambdas <- seq(0, 10, 0.25)
+rmses <- sapply(lambdas, function(l){
+  mu <- mean(train_set$rating)
+    
+  b_i_reg <- train_set %>%
+    group_by(movieId) %>%
+    summarise(b_i_reg = sum(rating - mu)/(n()+l))
+  
+  b_u_reg <- train_set %>%
+    left_join(b_i_reg, by="movieId") %>%
+    group_by(userId) %>%
+    summarise(b_u_reg = sum(rating - b_i_reg - mu)/(n()+l))
+  
+  pred_reg <- test_set %>%
+    left_join(b_i_reg, by = "movieId") %>%
+    left_join(b_u_reg, by = "userId") %>%
+    mutate(pred = mu + b_i_reg + b_u_reg) %>%
+    pull(pred)
+  
+  return(rmse(pred_reg, test_set$rating))
+})
+
+#to observe and obtain the optimal lambda
+qplot(lambdas, rmses)
+lambda <- lambdas[which.min(rmses)]
+
+# Having established the optimal lambda of 5, let's build our model
+b_i_reg <- train_set %>% 
+group_by(movieId) %>%
+  summarize(b_i = sum(rating - mu)/(n()+lambda))
+
+b_u_reg <- train_set %>% 
+  left_join(b_i, by="movieId") %>%
+  filter(!is.na(b_i)) %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - b_i - mu)/(n()+lambda))
+
+pred_reg <- test_set %>% 
+  left_join(b_i_reg, by='movieId') %>%
+  left_join(b_u_reg, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+rmse_reg <- rmse(pred_reg, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Regularised Movie + User Effect Model",
+                                 rmse = rmse_reg))
+rmse_results
+```
+
+With regularisation of the movie + user effect model, we obtain an RMSE of 0.86449, which represents a slight improvement over our unregularised move + user effect model. However, this may not allow us to achieve an RMSE < 0.86490 on our final holdout set.
+
+Let us try our hand at building a matrix factorisation model using the recosystem package. Matrix factorisation decomposes a user-item matrix into two low-ranked matrices (in this case, user and movie), that can predict a user's movie preference.
+```{r}
+# To begin, install and load the recosystem package
+if(!require(recosystem)) install.packages("recosystem", repos = "http://cran.us.r-project.org")
+library(recosystem)
+
+# Next, we convert the training and test sets into recosystem input format
+set.seed(123)
+train_recosystem <- with(train_set, 
+                         data_memory(user_index = userId,
+                                     item_index = movieId,
+                                     rating = rating))
+test_recosystem <- with(test_set, 
+                        data_memory(user_index = userId,
+                                    item_index = movieId,
+                                    rating = rating))
+
+# Next we create and tune the model using various parameters
+reco_system <- Reco()
+tuning <- reco_system$tune(train_recosystem,
+                           opts = list(dim = c(10, 20, 30),
+                                       lrate = c(0.1, 0.2),
+                                       costp_l2 = c(0.01, 0.1), 
+                                       costq_l2 = c(0.01, 0.1),
+                                       costp_l1 = 0, 
+                                       costq_l1 = 0, 
+                                       nthread  = 4,
+                                       niter = 10))
+
+# We then train the model with the best tuning parameters
+reco_system$train(train_recosystem, 
+                  opts = c(tuning$min, nthread = 4,niter = 100))
+
+pred_mf <-  reco_system$predict(test_recosystem, out_memory())
+rmse_mf <- rmse(pred_mf, test_set$rating)
+rmse_results <- bind_rows(rmse_results,
+                          tibble(method="Matrix factorisation",
+                                 rmse = rmse_mf))
+rmse_results
+```
+
+With a matrix factorisation model using recosystem, we obtain an RMSE of 0.78743, which blows our regularised movie + user effect model away.
+
+## Evaluation of our final model
+
+The RMSE of our matrix factorisation model is pretty satisfactory. Let us now evaluate the model on our final holdout set.
+```{r}
+set.seed(123)
+final_recosystem <- with(final_holdout_test, 
+                         data_memory(user_index = userId,
+                                     item_index = movieId))
+pred_final <-  reco_system$predict(final_recosystem, out_memory())
+rmse_final <- rmse(pred_final, final_holdout_test$rating)
+rmse_final
+```
+
+With the matrix factorisation model, we obtain an RMSE of 0.78771 on our final holdout set.
+
+## Conclusion
+
+In this project, we attempt to build a movie recommendation system using the 10M version of the MovieLens dataset. The working goal was to create a model that produces an RMSE < 0.86490 so as to achieve a high score for our project.
+
+We began by conducting some exploratory analyses to understand the dataset better. We saw that there were almost 7 times as many unique users as unique movies, and that users tend to rate high and using whole numbers. We also saw that most users rated less than 100 movies, and that most movies received between 10 and 1,000 ratings. Looking at the top and bottom rated movies, we found that most movies in the list were obscure movies. We concluded that the year of the movie likely did not affect it's ratings, but thought that the genre(s) might.
+
+With that, we built our first model using the mean baseline rating, upon which we factored movie, user, and genre biases. We found that genre was not a useful predictor, and continued without it. We then applied regularisation to our movie + user effect model bringing our RMSE just below the end goal. Finally, we tested out a matrix factorisation model, built using the recosystem package. With that we obtained a very satisfactory RMSE score on our validation set, and ultimately, on our final holdout set.
+
+I hope this exercise helped the reader glimpse into my thought process in building my first movie recommendation model. It was fun, frustrating, and everything in between!
