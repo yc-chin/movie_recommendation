@@ -9,3 +9,5 @@ Here is a broad overview of the project’s implementation:
 4. Implement a content-based filtering strategy
 5. Implement matrix factorisation using the recosystem package
 6. Evaluate the model using the final holdout set
+
+The pdf file in this repository provides a step-by-step guide on how the movie recommendation was developed.
